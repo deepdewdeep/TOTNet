@@ -13,14 +13,13 @@ sys.path.append('./')
 from data_process.video_loader import Video_Loader
 from data_process.folder_loader import Folder_Loader
 from model.model_utils import load_pretrained_model
-from PhysicsInformedDeformableAttentionNetwork.src.model.TOTNet import build_motion_model_light
-from model.motion_model import build_motion_model
-from PhysicsInformedDeformableAttentionNetwork.src.model.TOTNet_OF import build_motion_model_light_opticalflow
+from model.TOTNet import build_motion_model_light
+from model.TOTNet_OF import build_motion_model_light_opticalflow
 from model.tracknet import build_TrackNetV2
 from model.wasb import build_wasb
 from config.config import parse_configs
 from utils.misc import time_synchronized
-from losses_metrics.metrics import extract_coords
+from losses_metrics.metrics import extract_coords, extract_coords2d
 
 
 def demo(configs):
@@ -41,8 +40,6 @@ def demo(configs):
     # Model
     if configs.model_choice == 'motion_light':
         model = build_motion_model_light(configs)
-    elif configs.model_choice == 'motion':
-        model = build_motion_model(configs)
     elif configs.model_choice == 'wasb':
         model = build_wasb(configs)
     elif configs.model_choice == 'motion_light_opticalflow':
@@ -66,10 +63,17 @@ def demo(configs):
     model.eval()
     frame_idx = int(configs.num_frames - 1)
 
+    model_h, model_w = configs.img_size[0], configs.img_size[1]
+
     with torch.no_grad():
-        for count, resized_imgs, current_frame in data_loader:
-            resized_imgs = torch.from_numpy(resized_imgs).to(configs.device, non_blocking=True).float().unsqueeze(0)
-            batched_data = resized_imgs
+        for batch in data_loader:
+            # Video_Loader yields (count, stacked_frames, resized_frame, original_frame)
+            # Folder_Loader yields (count, stacked_frames, resized_frame)
+            count = batch[0]
+            stacked_frames = batch[1]   # [N, C, H, W] normalised tensor used as model input
+            original_frame = batch[3] if len(batch) > 3 else batch[2]  # full-res RGB frame for annotation
+
+            batched_data = torch.from_numpy(stacked_frames).to(configs.device, non_blocking=True).float().unsqueeze(0)
             t1 = time.time()
 
             if configs.model_choice == 'wasb' or configs.model_choice == 'tracknetv2':
@@ -78,21 +82,32 @@ def demo(configs):
                 batched_data = batched_data.permute(0, 2, 1, 3, 4).contiguous()  # Shape: [B, C, N, H, W]
                 # Reshape to combine frames into the channel dimension
                 batched_data = batched_data.view(B, N * C, H, W)  # Shape: [B, N*C, H, W]
-   
-            heatmap_output, pred_event = model(batched_data)
-            t2 = time.time()
-          
 
-            post_processed_coord = extract_coords(heatmap_output)
-            
-            x_pred, y_pred = post_processed_coord[0][0], post_processed_coord[0][1]
-            ball_pos = (int(x_pred), int(y_pred))  # Ensure integer coordinates
+            model_output = model(batched_data)
+            # For models that return a tuple (heatmap, event), separate them; otherwise treat as heatmap only
+            if isinstance(model_output, (tuple, list)):
+                heatmap = model_output[0]
+                pred_event = model_output[1] if len(model_output) > 1 else None
+            else:
+                heatmap = model_output
+                pred_event = None
+            t2 = time.time()
+
+            # Extract (x, y) coordinates from the flat 2-D heatmap [B, H*W]
+            post_processed_coord = extract_coords2d(heatmap, H=model_h, W=model_w)
+
+            x_pred, y_pred = post_processed_coord[0][0].item(), post_processed_coord[0][1].item()
+
+            # Scale coordinates from model space to original frame resolution
+            orig_h, orig_w = original_frame.shape[:2]
+            x_scaled = int(x_pred * orig_w / model_w)
+            y_scaled = int(y_pred * orig_h / model_h)
+            ball_pos = (x_scaled, y_scaled)
             print(ball_pos)
 
-          
             events = pred_event.cpu().numpy() if pred_event is not None else (0.0, 0.0)
 
-            ploted_img = plot_detection(current_frame.copy(), ball_pos, events)
+            ploted_img = plot_detection(original_frame.copy(), ball_pos, events)
 
             ploted_img = cv2.cvtColor(ploted_img, cv2.COLOR_RGB2BGR)
             if configs.show_image:
